@@ -1,0 +1,16 @@
+{
+    "base_model_path": "../stable-diffusion-inpainting",
+    "resume_path": "../catvton",
+    "data_root_path": "../vitonhd",
+    "output_dir": "adversarial_output",
+    "num_steps": 50,
+    "learning_rate": 0.01,
+    "batch_size": 1,
+    "device": "cuda:0",
+    "device_target": "cuda:1",
+    "height": 512,
+    "width": 512,
+    "eval_pair": false,
+    "num_inference_steps": 50,
+    "guidance_scale": 2.5
+} 
