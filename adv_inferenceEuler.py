@@ -7,9 +7,10 @@ from diffusers.image_processor import VaeImageProcessor
 from tqdm import tqdm
 from PIL import Image, ImageFilter
 import datetime
-from model.pipeline_mutiperson import CatVTONPipeline
+from model.pipelineEuler import CatVTONPipeline
 import warnings
 from torchvision.utils import save_image
+from nudenet import NudeDetector
 
 class InferenceDataset(Dataset):
     def __init__(self, args):
@@ -49,7 +50,7 @@ class VITONHDTestDataset(InferenceDataset):
     def load_data(self):
         # Determine the complete path of the pair file
         if self.args.pair_file_path:
-            # If a complete path is specified, use it directly
+            # If full path is specified, use it directly
             pair_txt = self.args.pair_file_path
         else:
             # Otherwise use data_root_path + pair_file
@@ -260,7 +261,7 @@ def parse_args():
     parser.add_argument(
         "--attack_steps",
         type=int,
-        default=500,#300
+        default=1,#300
         help="Number of optimization steps for attack",
     )
     parser.add_argument(
@@ -304,7 +305,7 @@ def parse_args():
     parser.add_argument(
         "--pair_file",
         type=str,
-        default="test_xxypairs.txt",
+        default="test_xxypairs5.txt",
         help="Name of the pair file to read (e.g., test_xxypairs.txt, test_pairs.txt)",
     )
     parser.add_argument(
@@ -353,11 +354,11 @@ def to_pil_image(images): # Image concatenation for easy evaluation of results
 
 def main():
     
-    swanlab.init(
-    # Set project name
-    project="CATVTON_muti",
-    logdir="./swanlog1",
-    )
+    # swanlab.init(
+    # # Set project name
+    # project="CATVTON_Adversarial_Testing",
+    # logdir="./swanlog1",
+    # )
     args = parse_args()
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -458,17 +459,17 @@ def main():
 
 
 
-            # Save optimized cloth image
-            save_dir = "/AdverCat/CatVTON-edited/optcloth"
+            # Save optimized clothing images
+            save_dir = " /AdverCat/CatVTON-edited/optcloth"
             os.makedirs(save_dir, exist_ok=True)
             
-            # Construct filename for each sample in the batch and save
+            # Construct filenames and save for each sample in the batch
             for batch_idx in range(condition_image.size(0)):
                 person_name = batch['person_name'][batch_idx]
                 cloth_name = batch['cloth_name'][batch_idx]
                 target_cloth_name = batch['target_cloth_name'][batch_idx]
                 
-                # Remove file extensions
+                # Remove file extension
                 person_base = person_name.replace('.jpg', '').replace('.png', '')
                 cloth_base = cloth_name.replace('.jpg', '').replace('.png', '')
                 target_cloth_base = target_cloth_name.replace('.jpg', '').replace('.png', '')
@@ -477,14 +478,14 @@ def main():
                 image_name = f"model{person_base}__{person_base}ori{cloth_base}target{target_cloth_base}.png"
                 save_path = os.path.join(save_dir, image_name)
                 
-                # Save the optimized image for this sample
+                # Save optimized image for this sample
                 save_image(condition_image[batch_idx:batch_idx+1], save_path)
             # Create visualization images
             for result in intermediate_results:
                 step = result['step']
                 condition_img = to_pil_image(result['condition_image'])[0]  # Convert tensor to PIL image
-                result_img0 = result['result'][0][0]  # First PIL image in the first result list
-                result_img1 = result['result'][1][0]  # First PIL image in the second result list
+                result_img0 = result['result'][0][0]  # First PIL image from the first result list
+                result_img1 = result['result'][1][0]  # First PIL image from the second result list
                 
                 # Create concatenated image containing condition image and two results
                 w, h = result_img0.size
@@ -550,7 +551,7 @@ def main():
             output_path0 = os.path.join(args.output_dir, f"{os.path.splitext(person_name)[0]}_result0{file_suffix}.png")
             output_path1 = os.path.join(args.output_dir, f"{os.path.splitext(person_name)[0]}_result1{file_suffix}.png")
             
-            # Ensure output directory exists
+            # Ensure output directories exist
             if not os.path.exists(os.path.dirname(output_path0)):
                 os.makedirs(os.path.dirname(output_path0))
                 
@@ -563,7 +564,7 @@ def main():
                 result0 = repaint(person_image, mask, result0)
                 result1 = repaint(person_image, mask, result1)
                 
-            # If concatenation of results is needed
+            # If result concatenation is needed
             if args.concat_eval_results:
                 w, h = result0.size
                 if args.do_attack:
@@ -574,7 +575,7 @@ def main():
                     optimize_image = to_pil_image(condition_image)[i]  # Convert tensor to PIL image
                     optimize_image.save(optimize_path)
                 
-                    # In attack mode, display 6 images
+                    # Display 6 images in attack mode
                     concated_result = Image.new('RGB', (w*6, h))
                     concated_result.paste(person_images[i], (0, 0))
                     concated_result.paste(cloth_images[i], (w, 0))
@@ -585,7 +586,7 @@ def main():
                     concated_result.save(output_path0)
 
                 else:
-                    # In normal mode, can create two concatenated results (each containing one output from the model)
+                    # In normal mode, can create two concatenated results (each containing one output of the model)
                     concated_result0 = Image.new('RGB', (w*3, h))
                     concated_result0.paste(person_images[i], (0, 0))
                     concated_result0.paste(cloth_images[i], (w, 0))

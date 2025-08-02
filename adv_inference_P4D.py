@@ -7,7 +7,7 @@ from diffusers.image_processor import VaeImageProcessor
 from tqdm import tqdm
 from PIL import Image, ImageFilter
 import datetime
-from model.pipeline_mutiperson import CatVTONPipeline
+from model.pipeline_P4D import CatVTONPipeline
 import warnings
 from torchvision.utils import save_image
 
@@ -34,8 +34,6 @@ class InferenceDataset(Dataset):
         return {
             'index': idx,
             'person_name': data['person_name'],
-            'cloth_name': data.get('cloth_name', ''),
-            'target_cloth_name': data.get('target_cloth_name', ''),
             'person': self.vae_processor.preprocess(person, self.args.height, self.args.width)[0],
             'cloth': self.vae_processor.preprocess(cloth, self.args.height, self.args.width)[0],
             'target_cloth': self.vae_processor.preprocess(target_cloth, self.args.height, self.args.width)[0],
@@ -47,16 +45,14 @@ class InferenceDataset(Dataset):
 
 class VITONHDTestDataset(InferenceDataset):
     def load_data(self):
-        # Determine the complete path of the pair file
         if self.args.pair_file_path:
             # If a complete path is specified, use it directly
             pair_txt = self.args.pair_file_path
         else:
             # Otherwise use data_root_path + pair_file
             pair_txt = os.path.join(self.args.data_root_path, self.args.pair_file)
-        
         assert os.path.exists(pair_txt), f"File {pair_txt} does not exist."
-        
+
         with open(pair_txt, 'r') as f:
             lines = f.readlines()
         self.args.data_root_path = os.path.join(self.args.data_root_path, "test")
@@ -75,8 +71,6 @@ class VITONHDTestDataset(InferenceDataset):
                 target_cloth_img = main_person
             data.append({
                 'person_name': main_person,
-                'cloth_name': cloth_img,
-                'target_cloth_name': target_cloth_img,
                 'person': os.path.join(self.args.data_root_path, 'image', main_person),
                 'cloth': os.path.join(self.args.data_root_path, 'cloth', cloth_img),
                 'target_cloth': os.path.join(self.args.data_root_path, 'cloth', target_cloth_img),                
@@ -169,10 +163,15 @@ def parse_args():
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=2.5,
+        default=0,
         help="The scale of classifier-free guidance for inference.",
     )
-
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=3.0,
+        help="Beta parameter for attack optimization.",
+    )
     parser.add_argument(
         "--width",
         type=int,
@@ -260,7 +259,7 @@ def parse_args():
     parser.add_argument(
         "--attack_steps",
         type=int,
-        default=500,#300
+        default=500,
         help="Number of optimization steps for attack",
     )
     parser.add_argument(
@@ -272,7 +271,13 @@ def parse_args():
     parser.add_argument(
         "--k",
         type=float,
-        default=0.2,
+        default=0.025,
+        help="Weight of loss2 (condition_latent, ref_condition_latent)",
+    )
+    parser.add_argument(
+        "--k_max",
+        type=float,
+        default=7000,
         help="Weight of loss2 (condition_latent, ref_condition_latent)",
     )
 
@@ -285,26 +290,32 @@ def parse_args():
     parser.add_argument(
         "--visualize_interval",
         type=int,
-        default=10,
+        default=20,
         help="Number of different person models to use in the optimization (0 for all)",
     )
-
+    parser.add_argument(
+        "--refresh_final_latent",
+        type=int,
+        default=3,
+        help="Number of different person models to use in the optimization (0 for all)",
+    )
     parser.add_argument(
         "--use_lpips",
         action = "store_false",
-        default = True,
+        default = False,
         help="Whether to perform attack optimization",
     )
     parser.add_argument(
-        "--patience",
-        type=int,
-        default=5,
-        help="Number of steps without improvement before reducing learning rate",
+        "--dynamic_weight",
+        action = "store_false",
+        default = False,
+        help="Whether to perform attack optimization",
     )
+
     parser.add_argument(
         "--pair_file",
         type=str,
-        default="test_xxypairs.txt",
+        default="pairs1.txt",
         help="Name of the pair file to read (e.g., test_xxypairs.txt, test_pairs.txt)",
     )
     parser.add_argument(
@@ -314,7 +325,6 @@ def parse_args():
         help="Full path to the pair file. If provided, this overrides data_root_path + pair_file",
     )
 
-   
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -352,19 +362,13 @@ def to_pil_image(images): # Image concatenation for easy evaluation of results
 
 
 def main():
-    
-    swanlab.init(
-    # Set project name
-    project="CATVTON_muti",
-    logdir="./swanlog1",
-    )
     args = parse_args()
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Create directory name containing parameter information, first time, then other parameters
     params_info = ""
     if args.do_attack:
-        params_info = f"{current_time}_k{args.k}_steps{args.attack_steps}_models{args.model_pool_size}"
+        params_info = f"{current_time}_k{args.k}_Beta{args.beta}_k_max{args.k_max}_steps{args.attack_steps}_models{args.model_pool_size}"
     else:
         params_info = current_time
 
@@ -380,7 +384,8 @@ def main():
         }[args.mixed_precision],
         device="cuda",
         skip_safety_check=True,
-
+        beta=args.beta, 
+        kmax=args.k_max,
     )
     # Dataset
     if args.dataset_name == "vitonhd":
@@ -431,75 +436,74 @@ def main():
             # Store original cloth image as reference for regularization
             ref_condition_image = cloth_images.clone()
 
-
-            # Execute attack
-            condition_image,intermediate_results = pipeline.attack(
-                ref_persons,
-                condition_image,
-                ref_condition_image,
-                target_cloth_images,
-                ref_masks,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                height=args.height,
-                width=args.width,
-                generator=generator,
-                attack_steps=args.attack_steps,
-                attack_lr=args.attack_lr,
-                k=args.k,
-                visualize_interval = args.visualize_interval, # Visualize every n steps
-                use_lpips=args.use_lpips,  # LPIPS loss
-                patience=args.patience,
-            )
-
-            # Save intermediate results
-            if not os.path.exists(os.path.join(args.output_dir, "intermediate_results")):
-                os.makedirs(os.path.join(args.output_dir, "intermediate_results"))
-
-
-
-            # Save optimized cloth image
-            save_dir = "/AdverCat/CatVTON-edited/optcloth"
-            os.makedirs(save_dir, exist_ok=True)
-            
-            # Construct filename for each sample in the batch and save
-            for batch_idx in range(condition_image.size(0)):
-                person_name = batch['person_name'][batch_idx]
-                cloth_name = batch['cloth_name'][batch_idx]
-                target_cloth_name = batch['target_cloth_name'][batch_idx]
+            # Loop through different models to optimize condition_image, which is the cloth being optimized
+            for i in range(min(args.model_pool_size, ref_persons.size(1))):
+                print(f"Using model {i+1}/{min(args.model_pool_size, ref_persons.size(1))} for optimization")
                 
-                # Remove file extensions
-                person_base = person_name.replace('.jpg', '').replace('.png', '')
-                cloth_base = cloth_name.replace('.jpg', '').replace('.png', '')
-                target_cloth_base = target_cloth_name.replace('.jpg', '').replace('.png', '')
-                
-                # Construct filename according to required format: model{person}__ori{cloth}target{target_cloth}
-                image_name = f"model{person_base}__{person_base}ori{cloth_base}target{target_cloth_base}.png"
-                save_path = os.path.join(save_dir, image_name)
-                
-                # Save the optimized image for this sample
-                save_image(condition_image[batch_idx:batch_idx+1], save_path)
-            # Create visualization images
-            for result in intermediate_results:
-                step = result['step']
-                condition_img = to_pil_image(result['condition_image'])[0]  # Convert tensor to PIL image
-                result_img0 = result['result'][0][0]  # First PIL image in the first result list
-                result_img1 = result['result'][1][0]  # First PIL image in the second result list
-                
-                # Create concatenated image containing condition image and two results
-                w, h = result_img0.size
-                concat_img = Image.new('RGB', (w*3, h))
-                concat_img.paste(condition_img, (0, 0))
-                concat_img.paste(result_img0, (w, 0))
-                concat_img.paste(result_img1, (w*2, 0))
-                
-                # Save concatenated image
-                output_path = os.path.join(
-                    args.output_dir, 
-                    "intermediate_results", 
-                    f"step{step:04d}.png"
+                current_person = ref_persons[:, i, :, :, :]
+                current_mask = ref_masks[:, i, :, :, :]
+
+                # Get target results
+                target_results = pipeline(
+                    current_person,                
+                    condition_image,
+                    target_cloth_images,
+                    current_mask,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    height=args.height,
+                    width=args.width,
+                    generator=generator,
+                    ret_latent=True,
                 )
-                concat_img.save(output_path)
+
+                # Execute attack
+                condition_image,intermediate_results = pipeline.attack(
+                    current_person,
+                    condition_image,
+                    ref_condition_image,
+                    target_cloth_images,
+                    current_mask,
+                    target_results,  
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    height=args.height,
+                    width=args.width,
+                    generator=generator,
+                    attack_steps=args.attack_steps,
+                    attack_lr=args.attack_lr,
+                    k=args.k,
+                    visualize_interval = args.visualize_interval, # Visualize every n steps
+                    refresh_final_latent = args.refresh_final_latent, # Update final_latent every n steps
+                    use_lpips=args.use_lpips,  # LPIPS loss
+                    dynamic_weight=args.dynamic_weight,  # Enable dynamic weighting
+                )
+
+                # Save intermediate results
+                if not os.path.exists(os.path.join(args.output_dir, "intermediate_results")):
+                    os.makedirs(os.path.join(args.output_dir, "intermediate_results"))
+
+                # Create visualization images
+                for result in intermediate_results:
+                    step = result['step']
+                    condition_img = to_pil_image(result['condition_image'])[0]  # Convert tensor to PIL image
+                    result_img0 = result['result'][0][0]  # First PIL image in the first result list
+                    result_img1 = result['result'][1][0]  # First PIL image in the second result list
+                    
+                    # Create concatenated image containing condition image and two results
+                    w, h = result_img0.size
+                    concat_img = Image.new('RGB', (w*3, h))
+                    concat_img.paste(condition_img, (0, 0))
+                    concat_img.paste(result_img0, (w, 0))
+                    concat_img.paste(result_img1, (w*2, 0))
+                    
+                    # Save concatenated image
+                    output_path = os.path.join(
+                        args.output_dir, 
+                        "intermediate_results", 
+                        f"step{step:04d}.png"
+                    )
+                    concat_img.save(output_path)
 
             # Use optimized condition image for final inference
             results = pipeline(
@@ -536,13 +540,14 @@ def main():
             target_cloth_images = to_pil_image(target_cloth_images) 
             masks = to_pil_image(masks)
 
+
         # Process each result image
         for i, (result0, result1) in enumerate(zip(results[0], results[1])):  # Unpack two results
             person_name = batch['person_name'][i]
 
             # Add parameter information to filename, first time, then other parameters
             if args.do_attack:
-                file_suffix = f"_{current_time}_k{args.k}_steps{args.attack_steps}_models{args.model_pool_size}"
+                file_suffix = f"_{current_time}_k{args.k}_Beta{args.beta}_steps{args.attack_steps}_models{args.model_pool_size}"
             else:
                 file_suffix = f"_{current_time}"
 
@@ -603,5 +608,4 @@ def main():
                 result1.save(output_path1)
 
 if __name__ == "__main__":
-    warnings.filterwarnings("ignore")
     main()

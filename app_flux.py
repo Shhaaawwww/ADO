@@ -276,10 +276,10 @@ def app_gradio():
     
     demo.queue().launch(share=True, show_error=True)
 
-# 解析参数
+# Parse arguments
 args = parse_args()
 
-# 加载模型
+# Load model
 repo_path = snapshot_download(repo_id=args.resume_path)
 pipeline_flux = FluxTryOnPipeline.from_pretrained(args.base_model_path)
 pipeline_flux.load_lora_weights(
@@ -288,7 +288,7 @@ pipeline_flux.load_lora_weights(
 )
 pipeline_flux.to("cuda", torch.bfloat16)
 
-# 初始化 AutoMasker
+# Initialize AutoMasker
 mask_processor = VaeImageProcessor(
     vae_scale_factor=8, 
     do_normalize=False, 

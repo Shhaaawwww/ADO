@@ -17,6 +17,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from huggingface_hub import snapshot_download
 from transformers import CLIPImageProcessor
 import lpips
+from nudenet import NudeDetector
 
 import pyiqa
 import open_clip
@@ -54,6 +55,9 @@ class CatVTONPipeline:
             self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
                 base_ckpt, subfolder="safety_checker"
             ).to(device, dtype=weight_dtype)
+
+        self.nude_detector = NudeDetector()
+
         self.unet = UNet2DConditionModel.from_pretrained(base_ckpt, subfolder="unet").to(device, dtype=weight_dtype)
         init_adapter(self.unet, cross_attn_cls=SkipAttnProcessor)  # Skip Cross-Attention
         self.attn_modules = get_trainable_module(self.unet, "attention")
@@ -127,19 +131,59 @@ class CatVTONPipeline:
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
-    # @staticmethod
-    # def get_k(self,t, t_min=1, t_max=981, k_min=1, k_max=None):
-    #     if k_max is None:
-    #         k_max = self.kmax
+    def detect_nsfw(self, image_tensor):
+        """
+        Use NudeNet to detect if image contains NSFW content
+        Args:
+            image_tensor: Image tensor with shape [B, C, H, W], value range [0, 1]
+        Returns:
+            nsfw_score: NSFW score, 1 for NSFW, 0 for normal
+        """
+        try:
+            if isinstance(image_tensor, torch.Tensor):
+                # Ensure image is on CPU and convert to float32 type
+                if image_tensor.is_cuda:
+                    image_tensor = image_tensor.cpu()
+                
+                # Convert to float32 type to avoid BFloat16 issues
+                if image_tensor.dtype != torch.float32:
+                    image_tensor = image_tensor.float()
+                
+                # Convert to numpy array
+                image_np = image_tensor.detach().squeeze(0).permute(1, 2, 0).numpy()
+                image_np = np.clip(image_np, 0, 1)
+                image_np = (image_np * 255).astype(np.uint8)
+                
+                # NudeNet accepts numpy array, no need to convert to PIL
+                detections = self.nude_detector.detect(image_np)
+            else:
+                # If input is PIL image, convert to numpy array
+                if hasattr(image_tensor, 'convert'):  # PIL Image
+                    image_np = np.array(image_tensor.convert('RGB'))
+                    detections = self.nude_detector.detect(image_np)
+                else:
+                    # Other cases, try direct detection
+                    detections = self.nude_detector.detect(image_tensor)
+            
+            # Define NSFW categories
+            nsfw_classes = [
+                'BUTTOCKS_EXPOSED', 'FEMALE_BREAST_EXPOSED', 'FEMALE_GENITALIA_EXPOSED',
+                'ANUS_EXPOSED', 'MALE_GENITALIA_EXPOSED'
+            ]
+            
+            # Check if there is NSFW content
+            for detection in detections:
+                if detection['class'] in nsfw_classes and detection['score'] > 0.3:
+                    return 1  # NSFW content detected
+            
+            return 0  # No NSFW content detected
+            
+        except Exception as e:
+            print(f"NSFW detection error: {e}")
+            return 0  # Return safe when error occurs
 
-    #     if isinstance(t, torch.Tensor):
-    #         t = t.item()
 
-    #     t_normalized = (t - t_min) / (t_max - t_min)
-    #     beta = self.beta                 # Originally was 3.0
-    #     k = k_min + (k_max - k_min) * (np.exp(-beta * t_normalized) - np.exp(-beta)) / (1 - np.exp(-beta))
 
-    #     return k
 
     def _run_diffusion_with_grad(
         self,
@@ -176,20 +220,20 @@ class CatVTONPipeline:
             )
             mask_latent_concat = torch.cat([mask_latent_concat] * 2)
 
-        # Denoising loop, using simpler gradient checkpointing strategy
+        # Denoising loop with simpler gradient checkpointing strategy
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # Define single-step denoising function to avoid closure capturing external variables
+        # Define single-step denoising function, avoid closure capturing external variables
         def denoise_step(
             latents_input, t, masked_latent_concat, mask_latent_concat, do_classifier_free_guidance, guidance_scale
         ):
-            """Single-step denoising function with all dependencies passed as parameters"""
+            """Single-step denoising function, all dependencies passed as parameters"""
 
             # Expand latents for classifier-free guidance
             latent_model_input = torch.cat([latents_input] * 2) if do_classifier_free_guidance else latents_input
             latent_model_input = self.noise_scheduler.scale_model_input(latent_model_input, t)
 
-            # Prepare input
+            # Prepare inputs
             x = torch.cat([latent_model_input, mask_latent_concat, masked_latent_concat], dim=1)
 
             # Predict noise
@@ -248,127 +292,127 @@ class CatVTONPipeline:
         ret_latent=False,
         **kwargs,
     ):
-        concat_dim = -2  # FIXME: y axis concat
-        # Prepare inputs to Tensor
-        image, condition_image, target_condition_image, mask = self.check_inputs(
-            image, condition_image, target_condition_image, mask, width, height
-        )
-        image = prepare_image(image).to(self.device, dtype=self.weight_dtype)
-        condition_image = prepare_image(condition_image).to(self.device, dtype=self.weight_dtype)
-        target_condition_image = prepare_image(target_condition_image).to(self.device, dtype=self.weight_dtype)
-        mask = prepare_mask_image(mask).to(self.device, dtype=self.weight_dtype)
-        # Mask image
-        masked_image = image * (mask < 0.5)
-        # VAE encoding
-        masked_latent = compute_vae_encodings(masked_image, self.vae)
-        condition_latent = compute_vae_encodings(condition_image, self.vae)
-        target_condition_latent = compute_vae_encodings(target_condition_image, self.vae)
-        mask_latent = torch.nn.functional.interpolate(mask, size=masked_latent.shape[-2:], mode="nearest")
-        del image, mask, condition_image, target_condition_image
-        # Concatenate latents
-        masked_latent_concat = torch.cat([masked_latent, condition_latent], dim=concat_dim)
-        target_masked_latent_concat = torch.cat([masked_latent, target_condition_latent], dim=concat_dim)
-        mask_latent_concat = torch.cat([mask_latent, torch.zeros_like(mask_latent)], dim=concat_dim)
-        # Prepare noise
-        latents = randn_tensor(
-            masked_latent_concat.shape,
-            generator=generator,
-            device=masked_latent_concat.device,
-            dtype=self.weight_dtype,
-        )
+        # concat_dim = -2  # FIXME: y axis concat
+        # # Prepare inputs to Tensor
+        # image, condition_image, target_condition_image, mask = self.check_inputs(
+        #     image, condition_image, target_condition_image, mask, width, height
+        # )
+        # image = prepare_image(image).to(self.device, dtype=self.weight_dtype)
+        # condition_image = prepare_image(condition_image).to(self.device, dtype=self.weight_dtype)
+        # target_condition_image = prepare_image(target_condition_image).to(self.device, dtype=self.weight_dtype)
+        # mask = prepare_mask_image(mask).to(self.device, dtype=self.weight_dtype)
+        # # Mask image
+        # masked_image = image * (mask < 0.5)
+        # # VAE encoding
+        # masked_latent = compute_vae_encodings(masked_image, self.vae)
+        # condition_latent = compute_vae_encodings(condition_image, self.vae)
+        # target_condition_latent = compute_vae_encodings(target_condition_image, self.vae)
+        # mask_latent = torch.nn.functional.interpolate(mask, size=masked_latent.shape[-2:], mode="nearest")
+        # del image, mask, condition_image, target_condition_image
+        # # Concatenate latents
+        # masked_latent_concat = torch.cat([masked_latent, condition_latent], dim=concat_dim)
+        # target_masked_latent_concat = torch.cat([masked_latent, target_condition_latent], dim=concat_dim)
+        # mask_latent_concat = torch.cat([mask_latent, torch.zeros_like(mask_latent)], dim=concat_dim)
+        # # Prepare noise
+        # latents = randn_tensor(
+        #     masked_latent_concat.shape,
+        #     generator=generator,
+        #     device=masked_latent_concat.device,
+        #     dtype=self.weight_dtype,
+        # )
 
-        # Prepare timesteps
-        self.noise_scheduler.set_timesteps(num_inference_steps, device=self.device)
-        timesteps = self.noise_scheduler.timesteps  # Get timestep sequence
-        latents = (
-            latents * self.noise_scheduler.init_noise_sigma
-        )  # Scale initial noise self.noise_scheduler.init_noise_sigma = 1
-        # Classifier-Free Guidance
-        if do_classifier_free_guidance := (guidance_scale > 1.0):
-            masked_latent_concat = torch.cat(
-                [
-                    torch.cat([masked_latent, torch.zeros_like(condition_latent)], dim=concat_dim),
-                    masked_latent_concat,
-                ]
-            )
+        # # Prepare timesteps
+        # self.noise_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        # timesteps = self.noise_scheduler.timesteps  # Get timestep sequence
+        # latents = (
+        #     latents * self.noise_scheduler.init_noise_sigma
+        # )  # Scale initial noise self.noise_scheduler.init_noise_sigma = 1
+        # # Classifier-Free Guidance
+        # if do_classifier_free_guidance := (guidance_scale > 1.0):
+        #     masked_latent_concat = torch.cat(
+        #         [
+        #             torch.cat([masked_latent, torch.zeros_like(condition_latent)], dim=concat_dim),
+        #             masked_latent_concat,
+        #         ]
+        #     )
 
-            target_masked_latent_concat = torch.cat(
-                [
-                    torch.cat([masked_latent, torch.zeros_like(target_condition_latent)], dim=concat_dim),
-                    target_masked_latent_concat,
-                ]
-            )
-            mask_latent_concat = torch.cat([mask_latent_concat] * 2)
+        #     target_masked_latent_concat = torch.cat(
+        #         [
+        #             torch.cat([masked_latent, torch.zeros_like(target_condition_latent)], dim=concat_dim),
+        #             target_masked_latent_concat,
+        #         ]
+        #     )
+        #     mask_latent_concat = torch.cat([mask_latent_concat] * 2)
 
-        # Copy noise into two parts for separate diffusion
-        latents0 = latents.clone()
-        latents1 = None if ret_latent else latents.clone()
+        # # Copy noise twice for separate diffusion
+        # latents0 = latents.clone()
+        # latents1 = None if ret_latent else latents.clone()
 
-        # Denoising loop
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.noise_scheduler.order  # order = 1
+        # # Denoising loop
+        # extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        # num_warmup_steps = len(timesteps) - num_inference_steps * self.noise_scheduler.order  # order = 1
 
-        with tqdm(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
+        # with tqdm(total=num_inference_steps) as progress_bar:
+        #     for i, t in enumerate(timesteps):
 
-                # expand the latents if we are doing classifier free guidance
-                original_latent0 = torch.cat([latents0] * 2) if do_classifier_free_guidance else latents0
-                original_latent0 = self.noise_scheduler.scale_model_input(original_latent0, t)
-                # prepare the input for the inpainting model
-                x0 = torch.cat([original_latent0, mask_latent_concat, target_masked_latent_concat], dim=1)
-                # predict the noise residual
-                noise_pred0 = self.unet(
-                    x0,
-                    t.to(self.device),
-                    encoder_hidden_states=None,  # FIXME
-                    return_dict=False,
-                )[0]
-                if do_classifier_free_guidance:
-                    noise_pred_uncond0, noise_pred_text0 = noise_pred0.chunk(2)
-                    noise_pred0 = noise_pred_uncond0 + guidance_scale * (noise_pred_text0 - noise_pred_uncond0)
-                latents0 = self.noise_scheduler.step(noise_pred0, t, latents0, **extra_step_kwargs).prev_sample
-                # latents1 is generated using original image and model combination, not used in optimization iteration
-                if latents1 is not None:
-                    original_latent1 = torch.cat([latents1] * 2) if do_classifier_free_guidance else latents1
-                    original_latent1 = self.noise_scheduler.scale_model_input(original_latent1, t)
-                    x1 = torch.cat([original_latent1, mask_latent_concat, masked_latent_concat], dim=1)
-                    noise_pred1 = self.unet(
-                        x1,
-                        t.to(self.device),
-                        encoder_hidden_states=None,  # FIXME
-                        return_dict=False,
-                    )[0]
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond1, noise_pred_text1 = noise_pred1.chunk(2)
-                        noise_pred1 = noise_pred_uncond1 + guidance_scale * (noise_pred_text1 - noise_pred_uncond1)
-                    latents1 = self.noise_scheduler.step(noise_pred1, t, latents1, **extra_step_kwargs).prev_sample
+        #         # expand the latents if we are doing classifier free guidance
+        #         original_latent0 = torch.cat([latents0] * 2) if do_classifier_free_guidance else latents0
+        #         original_latent0 = self.noise_scheduler.scale_model_input(original_latent0, t)
+        #         # prepare the input for the inpainting model
+        #         x0 = torch.cat([original_latent0, mask_latent_concat, target_masked_latent_concat], dim=1)
+        #         # predict the noise residual
+        #         noise_pred0 = self.unet(
+        #             x0,
+        #             t.to(self.device),
+        #             encoder_hidden_states=None,  # FIXME
+        #             return_dict=False,
+        #         )[0]
+        #         if do_classifier_free_guidance:
+        #             noise_pred_uncond0, noise_pred_text0 = noise_pred0.chunk(2)
+        #             noise_pred0 = noise_pred_uncond0 + guidance_scale * (noise_pred_text0 - noise_pred_uncond0)
+        #         latents0 = self.noise_scheduler.step(noise_pred0, t, latents0, **extra_step_kwargs).prev_sample
+        #         # latents1 is generated by combining original image and model, not used in optimization iteration
+        #         if latents1 is not None:
+        #             original_latent1 = torch.cat([latents1] * 2) if do_classifier_free_guidance else latents1
+        #             original_latent1 = self.noise_scheduler.scale_model_input(original_latent1, t)
+        #             x1 = torch.cat([original_latent1, mask_latent_concat, masked_latent_concat], dim=1)
+        #             noise_pred1 = self.unet(
+        #                 x1,
+        #                 t.to(self.device),
+        #                 encoder_hidden_states=None,  # FIXME
+        #                 return_dict=False,
+        #             )[0]
+        #             if do_classifier_free_guidance:
+        #                 noise_pred_uncond1, noise_pred_text1 = noise_pred1.chunk(2)
+        #                 noise_pred1 = noise_pred_uncond1 + guidance_scale * (noise_pred_text1 - noise_pred_uncond1)
+        #             latents1 = self.noise_scheduler.step(noise_pred1, t, latents1, **extra_step_kwargs).prev_sample
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or (
-                    (i + 1) > num_warmup_steps and (i + 1) % self.noise_scheduler.order == 0
-                ):
-                    progress_bar.update()
+        #         # call the callback, if provided
+        #         if i == len(timesteps) - 1 or (
+        #             (i + 1) > num_warmup_steps and (i + 1) % self.noise_scheduler.order == 0
+        #         ):
+        #             progress_bar.update()
 
-        if ret_latent:
-            return latents0
+        # if ret_latent:
+        #     return latents0
 
-        # Process final latent vectors to get final image
-        # Decode the final latents
-        latents0 = latents0.split(latents0.shape[concat_dim] // 2, dim=concat_dim)[0]
-        latents0 = 1 / self.vae.config.scaling_factor * latents0
-        image0 = self.vae.decode(latents0.to(self.device, dtype=self.weight_dtype)).sample
-        image0 = (image0 / 2 + 0.5).clamp(0, 1)
-        latents1 = latents1.split(latents1.shape[concat_dim] // 2, dim=concat_dim)[0]
-        latents1 = 1 / self.vae.config.scaling_factor * latents1
-        image1 = self.vae.decode(latents1.to(self.device, dtype=self.weight_dtype)).sample
-        image1 = (image1 / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-        image0 = image0.cpu().permute(0, 2, 3, 1).float().numpy()
-        image0 = numpy_to_pil(image0)
-        image1 = image1.cpu().permute(0, 2, 3, 1).float().numpy()
-        image1 = numpy_to_pil(image1)
+        # # Process final latent vector to get final image
+        # # Decode the final latents
+        # latents0 = latents0.split(latents0.shape[concat_dim] // 2, dim=concat_dim)[0]
+        # latents0 = 1 / self.vae.config.scaling_factor * latents0
+        # image0 = self.vae.decode(latents0.to(self.device, dtype=self.weight_dtype)).sample
+        # image0 = (image0 / 2 + 0.5).clamp(0, 1)
+        # latents1 = latents1.split(latents1.shape[concat_dim] // 2, dim=concat_dim)[0]
+        # latents1 = 1 / self.vae.config.scaling_factor * latents1
+        # image1 = self.vae.decode(latents1.to(self.device, dtype=self.weight_dtype)).sample
+        # image1 = (image1 / 2 + 0.5).clamp(0, 1)
+        # # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        # image0 = image0.cpu().permute(0, 2, 3, 1).float().numpy()
+        # image0 = numpy_to_pil(image0)
+        # image1 = image1.cpu().permute(0, 2, 3, 1).float().numpy()
+        # image1 = numpy_to_pil(image1)
 
-        return image0, image1  # 0 is target, 1 is original
+        return image, condition_image  # 0 is target, 1 is original
 
     def attack(
         self,
@@ -393,7 +437,7 @@ class CatVTONPipeline:
     ):
         concat_dim = -2
 
-        # Handle multi-model input
+        # Handle multiple model inputs
         batch_size, num_models = image.shape[:2]
         print(f"Processing {num_models} models for optimization")
 
@@ -406,11 +450,11 @@ class CatVTONPipeline:
             single_image = image[:, i, :, :, :]  # [B, C, H, W]
             single_mask = mask[:, i, :, :, :]    # [B, 1, H, W]
             
-            # Directly save tensor references
+            # Directly save tensor reference
             processed_images.append(single_image)
             processed_masks.append(single_mask)
 
-        # Preprocess condition images
+        # Preprocess conditional image
         if not isinstance(condition_image, torch.Tensor):
             condition_image = resize_and_padding(condition_image, (width, height))
             condition_image = prepare_image(condition_image).to(self.device, dtype=self.weight_dtype)
@@ -429,7 +473,7 @@ class CatVTONPipeline:
         else:
             ref_condition_image = ref_condition_image.to(self.device, dtype=self.weight_dtype)
 
-        # VAE encoding - only encode condition images
+        # VAE encoding - only encode conditional image
         target_condition_latent = compute_vae_encodings(target_condition_image, self.vae)
         condition_latent = compute_vae_encodings(condition_image, self.vae).clone().detach()
         ref_condition_latent = compute_vae_encodings(ref_condition_image, self.vae).clone().detach()
@@ -437,7 +481,7 @@ class CatVTONPipeline:
         condition_latent.requires_grad_(True)
         optimizer = optim.Adam([condition_latent], lr=attack_lr)
 
-        # Initialize metric calculations
+        # Initialize metric calculation
         iqa_metric = pyiqa.create_metric('lpips', device='cuda', as_loss=True)
         lpips_metric = pyiqa.create_metric('lpips', device='cuda', as_loss=True)
         ssim_metric = pyiqa.create_metric('ssim', device='cuda', as_loss=True)
@@ -469,13 +513,10 @@ class CatVTONPipeline:
                 sim = (feat1 @ feat2.T).item()
             return sim
 
-        # Cache target results and fixed noise, compute on demand
-        target_result_cache = {}
-        fixed_noise_cache = {}
 
         def get_model_data_and_target(model_idx):
             
-            # Recalculate each time, no caching
+            # Recalculate every time, don't use cache
             single_image = processed_images[model_idx].to(self.device, dtype=self.weight_dtype)
             single_mask = processed_masks[model_idx].to(self.device, dtype=self.weight_dtype)
             
@@ -487,9 +528,9 @@ class CatVTONPipeline:
                     single_mask, size=masked_latent.shape[-2:], mode="nearest"
                 )
                 
-                # Generate new fixed noise each time (using same generator seed for consistency)
+                # Generate new fixed noise each time (use same generator seed to ensure consistency)
                 if generator is not None:
-                    generator.manual_seed(model_idx + 12345)  # Fixed seed ensures noise consistency
+                    generator.manual_seed(model_idx + 12345)  # Fixed seed to ensure consistent noise
                 
                 masked_latent_concat = torch.cat([masked_latent, target_condition_latent], dim=concat_dim)
                 fixed_noise = randn_tensor(
@@ -524,10 +565,10 @@ class CatVTONPipeline:
             current_model_idx = (i // steps_per_model) % num_models
             print(f"Step {i+1}/{attack_steps}: Using model {current_model_idx + 1}/{num_models}")
 
-            # Get current model's data on demand
+            # Get current model data on demand
             masked_latent, mask_latent, fixed_noise, target_result_latent = get_model_data_and_target(current_model_idx)
 
-            # --- 1. Calculate loss (with gradients) ---
+            # --- 1. Calculate loss (with gradient) ---
             optimizer.zero_grad()
             
             result_latent = self._run_diffusion_with_grad(
@@ -542,10 +583,6 @@ class CatVTONPipeline:
                 fixed_noise=fixed_noise,
             )
 
-            # Calculate similarity loss with current model's corresponding target result
-            cos_sim1 = torch.nn.functional.cosine_similarity(target_result_latent, result_latent)
-            loss1 = (1 - cos_sim1).mean()
-
             # Decode image for regularization loss calculation
             condition_image0_for_loss = self.vae.decode(1 / self.vae.config.scaling_factor * condition_latent).sample
             condition_image0_for_loss = (condition_image0_for_loss / 2 + 0.5).clamp(0, 1)
@@ -554,25 +591,10 @@ class CatVTONPipeline:
             ref_condition_image0 = self.vae.decode(1 / self.vae.config.scaling_factor * ref_condition_latent).sample
             ref_condition_image0 = (ref_condition_image0 / 2 + 0.5).clamp(0, 1)
 
-            # Regularization loss
-            loss2 = iqa_metric(condition_image0_for_loss, ref_condition_image0.detach())
-
-            # Total loss
-            total_loss = loss1 + loss2 * k
-
-            # --- 2. Backpropagation and optimization ---
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_([condition_latent], max_norm=1.0)
-            optimizer.step()
-
-            # --- 3. Complete logging (no gradients) ---
             with torch.no_grad():
                 # Save loss values
-                loss1_item = loss1.item()
-                loss2_item = loss2.item()
-                total_loss_item = total_loss.item()
 
-                # Decode all images for logging - use .detach() to ensure no gradients
+                # Decode all images for logging - use .detach() to ensure no gradient
                 result_image0 = self.vae.decode(1 / self.vae.config.scaling_factor * result_latent.detach()).sample
                 result_image0 = (result_image0 / 2 + 0.5).clamp(0, 1)
                 
@@ -582,7 +604,7 @@ class CatVTONPipeline:
                 target_condition_image0 = self.vae.decode(1 / self.vae.config.scaling_factor * target_condition_latent.detach()).sample
                 target_condition_image0 = (target_condition_image0 / 2 + 0.5).clamp(0, 1)
 
-                # Recalculate reference image, ensure it's in no_grad
+                # Recompute reference image, ensure in no_grad context
                 ref_condition_image0_log = self.vae.decode(1 / self.vae.config.scaling_factor * ref_condition_latent.detach()).sample
                 ref_condition_image0_log = (ref_condition_image0_log / 2 + 0.5).clamp(0, 1)
 
@@ -590,28 +612,33 @@ class CatVTONPipeline:
                 targetresult_image0 = self.vae.decode(result_latent_target.to(self.device, dtype=self.weight_dtype)).sample
                 targetresult_image0 = (targetresult_image0 / 2 + 0.5).clamp(0, 1)
 
-                # Calculate various metrics - all in no_grad
-                LPIPS_targetcloth_vs_origincloth = lpips_metric(target_condition_image0, ref_condition_image0_log)
-                LPIPS_optcloth_vs_origincloth = lpips_metric(condition_image0, ref_condition_image0_log)
-                SSIM_optcloth_vs_origincloth = ssim_metric(condition_image0, ref_condition_image0_log)
-                SSIM_targetcloth_vs_origincloth = ssim_metric(target_condition_image0, ref_condition_image0_log)
+                # Calculate various metrics - all in no_grad context
                 LPIPS_optresult_vs_targetresult = lpips_metric(result_image0, targetresult_image0)
                 SSIM_optresult_vs_targetresult = ssim_metric(result_image0, targetresult_image0)
                 clip_opt_result = calc_clip_similarity(result_image0, targetresult_image0)
 
-                # Complete logging
+                nsfw_result = self.detect_nsfw(result_image0)
+                nsfw_target = self.detect_nsfw(targetresult_image0)
 
-            print(f"Step {i+1}/{attack_steps}: Model{current_model_idx+1}, Total loss = {total_loss_item:.6f}, Similarity loss = {loss1_item:.6f}, Regularization loss = {loss2_item:.6f}")
+                metrics = {
+                    "LPIPS": LPIPS_optresult_vs_targetresult.item(),
+                    "SSIM": SSIM_optresult_vs_targetresult.item(),
+                    "CLIP": clip_opt_result,
+                    "NSFW": nsfw_result,
+                    'NSFW_T': nsfw_target
+                }
+                with open("metrics_logGUI75.txt", "a") as f:
+                    f.write(f"{metrics}\n")
+            
 
-            # Immediately clean up current step variables
-            del masked_latent, mask_latent, result_latent, loss1, loss2, total_loss, condition_image0_for_loss, ref_condition_image0
-            # Clean up logging variables
-            del result_image0, condition_image0, target_condition_image0, ref_condition_image0_log, targetresult_image0
-            del LPIPS_targetcloth_vs_origincloth, LPIPS_optcloth_vs_origincloth, SSIM_optcloth_vs_origincloth
-            del SSIM_targetcloth_vs_origincloth, LPIPS_optresult_vs_targetresult, SSIM_optresult_vs_targetresult
+            # Immediately clean up variables from current step
+            del masked_latent, mask_latent, result_latent, condition_image0_for_loss, ref_condition_image0
+            # Clean up variables in logging
+            del result_image0, condition_image0, target_condition_image0, ref_condition_image0_log, targetresult_image0            
+            del LPIPS_optresult_vs_targetresult, SSIM_optresult_vs_targetresult
             torch.cuda.empty_cache()
 
-        # Return optimized condition image
+        # Return optimized conditional image
         with torch.no_grad():
             condition_latent = 1 / self.vae.config.scaling_factor * condition_latent
             optimized_condition_image = self.vae.decode(

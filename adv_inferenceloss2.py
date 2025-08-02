@@ -7,7 +7,8 @@ from diffusers.image_processor import VaeImageProcessor
 from tqdm import tqdm
 from PIL import Image, ImageFilter
 import datetime
-from model.pipeline_mutiperson import CatVTONPipeline
+from model.pipelineloss2 import CatVTONPipeline
+import swanlab
 import warnings
 from torchvision.utils import save_image
 
@@ -49,7 +50,7 @@ class VITONHDTestDataset(InferenceDataset):
     def load_data(self):
         # Determine the complete path of the pair file
         if self.args.pair_file_path:
-            # If a complete path is specified, use it directly
+            # If full path is specified, use it directly
             pair_txt = self.args.pair_file_path
         else:
             # Otherwise use data_root_path + pair_file
@@ -272,7 +273,7 @@ def parse_args():
     parser.add_argument(
         "--k",
         type=float,
-        default=0.2,
+        default=0,
         help="Weight of loss2 (condition_latent, ref_condition_latent)",
     )
 
@@ -355,8 +356,9 @@ def main():
     
     swanlab.init(
     # Set project name
-    project="CATVTON_muti",
+    project="CatVTON_loss2",
     logdir="./swanlog1",
+
     )
     args = parse_args()
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -431,75 +433,81 @@ def main():
             # Store original cloth image as reference for regularization
             ref_condition_image = cloth_images.clone()
 
-
-            # Execute attack
-            condition_image,intermediate_results = pipeline.attack(
-                ref_persons,
-                condition_image,
-                ref_condition_image,
-                target_cloth_images,
-                ref_masks,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                height=args.height,
-                width=args.width,
-                generator=generator,
-                attack_steps=args.attack_steps,
-                attack_lr=args.attack_lr,
-                k=args.k,
-                visualize_interval = args.visualize_interval, # Visualize every n steps
-                use_lpips=args.use_lpips,  # LPIPS loss
-                patience=args.patience,
-            )
-
-            # Save intermediate results
-            if not os.path.exists(os.path.join(args.output_dir, "intermediate_results")):
-                os.makedirs(os.path.join(args.output_dir, "intermediate_results"))
-
-
-
-            # Save optimized cloth image
-            save_dir = "/AdverCat/CatVTON-edited/optcloth"
-            os.makedirs(save_dir, exist_ok=True)
-            
-            # Construct filename for each sample in the batch and save
-            for batch_idx in range(condition_image.size(0)):
-                person_name = batch['person_name'][batch_idx]
-                cloth_name = batch['cloth_name'][batch_idx]
-                target_cloth_name = batch['target_cloth_name'][batch_idx]
+            # Loop through different models to optimize condition_image (the cloth being optimized)
+            for i in range(min(args.model_pool_size, ref_persons.size(1))):
+                print(f"Using model {i+1}/{min(args.model_pool_size, ref_persons.size(1))} for optimization")
                 
-                # Remove file extensions
-                person_base = person_name.replace('.jpg', '').replace('.png', '')
-                cloth_base = cloth_name.replace('.jpg', '').replace('.png', '')
-                target_cloth_base = target_cloth_name.replace('.jpg', '').replace('.png', '')
-                
-                # Construct filename according to required format: model{person}__ori{cloth}target{target_cloth}
-                image_name = f"model{person_base}__{person_base}ori{cloth_base}target{target_cloth_base}.png"
-                save_path = os.path.join(save_dir, image_name)
-                
-                # Save the optimized image for this sample
-                save_image(condition_image[batch_idx:batch_idx+1], save_path)
-            # Create visualization images
-            for result in intermediate_results:
-                step = result['step']
-                condition_img = to_pil_image(result['condition_image'])[0]  # Convert tensor to PIL image
-                result_img0 = result['result'][0][0]  # First PIL image in the first result list
-                result_img1 = result['result'][1][0]  # First PIL image in the second result list
-                
-                # Create concatenated image containing condition image and two results
-                w, h = result_img0.size
-                concat_img = Image.new('RGB', (w*3, h))
-                concat_img.paste(condition_img, (0, 0))
-                concat_img.paste(result_img0, (w, 0))
-                concat_img.paste(result_img1, (w*2, 0))
-                
-                # Save concatenated image
-                output_path = os.path.join(
-                    args.output_dir, 
-                    "intermediate_results", 
-                    f"step{step:04d}.png"
+                current_person = ref_persons[:, i, :, :, :]
+                current_mask = ref_masks[:, i, :, :, :]
+
+                # Execute attack
+                condition_image,intermediate_results = pipeline.attack(
+                    current_person,
+                    condition_image,
+                    ref_condition_image,
+                    target_cloth_images,
+                    current_mask,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    height=args.height,
+                    width=args.width,
+                    generator=generator,
+                    attack_steps=args.attack_steps,
+                    attack_lr=args.attack_lr,
+                    k=args.k,
+                    visualize_interval = args.visualize_interval, # Visualize every n steps
+                    use_lpips=args.use_lpips,  # LPIPS loss
+                    patience=args.patience,
                 )
-                concat_img.save(output_path)
+
+                # Save intermediate results
+                if not os.path.exists(os.path.join(args.output_dir, "intermediate_results")):
+                    os.makedirs(os.path.join(args.output_dir, "intermediate_results"))
+
+
+
+                # Save optimized cloth images
+                save_dir = " /AdverCat/CatVTON-edited/optclothloss2"
+                os.makedirs(save_dir, exist_ok=True)
+                
+                # Construct filename for each sample in the batch and save
+                for batch_idx in range(condition_image.size(0)):
+                    person_name = batch['person_name'][batch_idx]
+                    cloth_name = batch['cloth_name'][batch_idx]
+                    target_cloth_name = batch['target_cloth_name'][batch_idx]
+                    
+                    # Remove file extensions
+                    person_base = person_name.replace('.jpg', '').replace('.png', '')
+                    cloth_base = cloth_name.replace('.jpg', '').replace('.png', '')
+                    target_cloth_base = target_cloth_name.replace('.jpg', '').replace('.png', '')
+                    
+                    # Construct filename in required format: model{person}__ori{cloth}target{target_cloth}
+                    image_name = f"model{person_base}__{person_base}ori{cloth_base}target{target_cloth_base}.png"
+                    save_path = os.path.join(save_dir, image_name)
+                    
+                    # Save the optimized image for this sample
+                    save_image(condition_image[batch_idx:batch_idx+1], save_path)
+                # Create visualization images
+                for result in intermediate_results:
+                    step = result['step']
+                    condition_img = to_pil_image(result['condition_image'])[0]  # Convert tensor to PIL image
+                    result_img0 = result['result'][0][0]  # First PIL image in first result list
+                    result_img1 = result['result'][1][0]  # First PIL image in second result list
+                    
+                    # Create concatenated image containing condition image and two results
+                    w, h = result_img0.size
+                    concat_img = Image.new('RGB', (w*3, h))
+                    concat_img.paste(condition_img, (0, 0))
+                    concat_img.paste(result_img0, (w, 0))
+                    concat_img.paste(result_img1, (w*2, 0))
+                    
+                    # Save concatenated image
+                    output_path = os.path.join(
+                        args.output_dir, 
+                        "intermediate_results", 
+                        f"step{step:04d}.png"
+                    )
+                    concat_img.save(output_path)
 
             # Use optimized condition image for final inference
             results = pipeline(
@@ -516,7 +524,7 @@ def main():
             )
 
         else:
-            # Original inference process
+            # Original inference flow
             results = pipeline(
                 person_images,                
                 cloth_images,
@@ -546,7 +554,7 @@ def main():
             else:
                 file_suffix = f"_{current_time}"
 
-            # Create different output paths for two results
+            # Create different output paths for the two results
             output_path0 = os.path.join(args.output_dir, f"{os.path.splitext(person_name)[0]}_result0{file_suffix}.png")
             output_path1 = os.path.join(args.output_dir, f"{os.path.splitext(person_name)[0]}_result1{file_suffix}.png")
             
@@ -598,7 +606,7 @@ def main():
                     concated_result1.paste(result1, (w*2, 0))
                     concated_result1.save(output_path1)
             else:
-                # If not concatenating, save two results separately
+                # If not concatenating, save the two results separately
                 result0.save(output_path0)
                 result1.save(output_path1)
 

@@ -7,9 +7,10 @@ from diffusers.image_processor import VaeImageProcessor
 from tqdm import tqdm
 from PIL import Image, ImageFilter
 import datetime
-from model.pipeline_mutiperson import CatVTONPipeline
+from model.pipelineGUI import CatVTONPipeline
 import warnings
 from torchvision.utils import save_image
+from nudenet import NudeDetector
 
 class InferenceDataset(Dataset):
     def __init__(self, args):
@@ -49,7 +50,7 @@ class VITONHDTestDataset(InferenceDataset):
     def load_data(self):
         # Determine the complete path of the pair file
         if self.args.pair_file_path:
-            # If a complete path is specified, use it directly
+            # If full path is specified, use it directly
             pair_txt = self.args.pair_file_path
         else:
             # Otherwise use data_root_path + pair_file
@@ -260,7 +261,7 @@ def parse_args():
     parser.add_argument(
         "--attack_steps",
         type=int,
-        default=500,#300
+        default=1,#300
         help="Number of optimization steps for attack",
     )
     parser.add_argument(
@@ -304,7 +305,7 @@ def parse_args():
     parser.add_argument(
         "--pair_file",
         type=str,
-        default="test_xxypairs.txt",
+        default="test_xxypairs5.txt",
         help="Name of the pair file to read (e.g., test_xxypairs.txt, test_pairs.txt)",
     )
     parser.add_argument(
@@ -353,11 +354,11 @@ def to_pil_image(images): # Image concatenation for easy evaluation of results
 
 def main():
     
-    swanlab.init(
-    # Set project name
-    project="CATVTON_muti",
-    logdir="./swanlog1",
-    )
+    # swanlab.init(
+    # # Set project name
+    # project="CATVTON_Adversarial_Testing",
+    # logdir="./swanlog1",
+    # )
     args = parse_args()
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -458,8 +459,8 @@ def main():
 
 
 
-            # Save optimized cloth image
-            save_dir = "/AdverCat/CatVTON-edited/optcloth"
+            # Save optimized cloth images
+            save_dir = " /AdverCat/CatVTON-edited/optcloth"
             os.makedirs(save_dir, exist_ok=True)
             
             # Construct filename for each sample in the batch and save
@@ -473,7 +474,7 @@ def main():
                 cloth_base = cloth_name.replace('.jpg', '').replace('.png', '')
                 target_cloth_base = target_cloth_name.replace('.jpg', '').replace('.png', '')
                 
-                # Construct filename according to required format: model{person}__ori{cloth}target{target_cloth}
+                # Construct filename in required format: model{person}__ori{cloth}target{target_cloth}
                 image_name = f"model{person_base}__{person_base}ori{cloth_base}target{target_cloth_base}.png"
                 save_path = os.path.join(save_dir, image_name)
                 
@@ -483,8 +484,8 @@ def main():
             for result in intermediate_results:
                 step = result['step']
                 condition_img = to_pil_image(result['condition_image'])[0]  # Convert tensor to PIL image
-                result_img0 = result['result'][0][0]  # First PIL image in the first result list
-                result_img1 = result['result'][1][0]  # First PIL image in the second result list
+                result_img0 = result['result'][0][0]  # First PIL image in first result list
+                result_img1 = result['result'][1][0]  # First PIL image in second result list
                 
                 # Create concatenated image containing condition image and two results
                 w, h = result_img0.size
@@ -516,7 +517,7 @@ def main():
             )
 
         else:
-            # Original inference process
+            # Original inference flow
             results = pipeline(
                 person_images,                
                 cloth_images,
@@ -546,7 +547,7 @@ def main():
             else:
                 file_suffix = f"_{current_time}"
 
-            # Create different output paths for two results
+            # Create different output paths for the two results
             output_path0 = os.path.join(args.output_dir, f"{os.path.splitext(person_name)[0]}_result0{file_suffix}.png")
             output_path1 = os.path.join(args.output_dir, f"{os.path.splitext(person_name)[0]}_result1{file_suffix}.png")
             
@@ -598,7 +599,7 @@ def main():
                     concated_result1.paste(result1, (w*2, 0))
                     concated_result1.save(output_path1)
             else:
-                # If not concatenating, save two results separately
+                # If not concatenating, save the two results separately
                 result0.save(output_path0)
                 result1.save(output_path1)
 

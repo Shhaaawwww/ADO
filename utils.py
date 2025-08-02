@@ -107,11 +107,11 @@ def compute_vae_encodings(image: torch.Tensor, vae: torch.nn.Module) -> torch.Te
     Returns:
         torch.Tensor: latent encoding of the image
     """
-    pixel_values = image.to(memory_format=torch.contiguous_format).float() # 转换为连续内存格式并确保为浮点类型
-    pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)         # 将图像移至VAE所在设备并匹配其数据类型
+    pixel_values = image.to(memory_format=torch.contiguous_format).float() # Convert to contiguous memory format and ensure float type
+    pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)         # Move image to VAE device and match its data type
     with torch.no_grad():
-        model_input = vae.encode(pixel_values).latent_dist.sample()     # 执行编码并从潜在分布中采样
-    model_input = model_input * vae.config.scaling_factor    # 应用缩放因子，使潜在表示适合扩散模型处理
+        model_input = vae.encode(pixel_values).latent_dist.sample()     # Perform encoding and sample from latent distribution
+    model_input = model_input * vae.config.scaling_factor    # Apply scaling factor to make latent representation suitable for diffusion model processing
     return model_input
 
 

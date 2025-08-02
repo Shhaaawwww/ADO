@@ -51,6 +51,22 @@ This repository contains an adversarial attack implementation for CatVTON, focus
    ```
    See `parse_args()` in the script for all configurable options.
 
+### Computing Infrastructure
+
+The experiments were conducted on a server with the following specifications. The key software versions are listed below.
+
+*   **Hardware:**
+    *   **GPU:** 3x NVIDIA RTX 3090 (24GB VRAM)
+    *   **CPU:** Intel(R) Xeon(R) Gold 6226R CPU @ 2.90GHz
+*   **Software:**
+    *   **OS:** Ubuntu 20.04.4 LTS
+    *   **CUDA:** 11.7
+    *   **Python:** 3.9
+    *   **PyTorch:** 1.13.1
+    *   **diffusers:** 0.21.4
+    *   **transformers:** 4.30.2
+    *   **xformers:** 0.0.20
+
 ### Acknowledgement
 
 This code is modified from [CatVTON](https://github.com/Zheng-Chong/CatVTON) and is intended for academic research and security analysis only.

@@ -7,9 +7,10 @@ from diffusers.image_processor import VaeImageProcessor
 from tqdm import tqdm
 from PIL import Image, ImageFilter
 import datetime
-from model.pipeline_mutiperson import CatVTONPipeline
+from model.pipelineDDPM import CatVTONPipeline
 import warnings
 from torchvision.utils import save_image
+from nudenet import NudeDetector
 
 class InferenceDataset(Dataset):
     def __init__(self, args):
@@ -260,7 +261,7 @@ def parse_args():
     parser.add_argument(
         "--attack_steps",
         type=int,
-        default=500,#300
+        default=1,#300
         help="Number of optimization steps for attack",
     )
     parser.add_argument(
@@ -304,7 +305,7 @@ def parse_args():
     parser.add_argument(
         "--pair_file",
         type=str,
-        default="test_xxypairs.txt",
+        default="test_xxypairs5.txt",
         help="Name of the pair file to read (e.g., test_xxypairs.txt, test_pairs.txt)",
     )
     parser.add_argument(
@@ -353,11 +354,11 @@ def to_pil_image(images): # Image concatenation for easy evaluation of results
 
 def main():
     
-    swanlab.init(
-    # Set project name
-    project="CATVTON_muti",
-    logdir="./swanlog1",
-    )
+    # swanlab.init(
+    # # Set project name
+    # project="CATVTON_Adversarial_Testing",
+    # logdir="./swanlog1",
+    # )
     args = parse_args()
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
